@@ -14,11 +14,7 @@ namespace IndexSuggestionsPOC
             CommandConnector connector = new CommandConnector();
             connector.Add(new ValidateInputLogLineColumnsCommand(context));
             connector.Add(new LoadGeneralInfoToContextCommand(context));
-            // TODO filter by username, database, etc.
-            connector.Add(new ActionDelegateCommand(() =>
-            {
-                return context.LogEntry.DatabaseName == "test" && context.LogEntry.ApplicationName != "[unknown]";
-            }));
+            connector.Add(new ApplyWorkloadDefinitionCommand(context));
             connector.Add(new ActionDelegateCommand(() =>
             {
                 var command = logParsingDetailCommandFactory.GetDetailCommand(context);

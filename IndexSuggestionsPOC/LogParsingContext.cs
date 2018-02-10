@@ -9,6 +9,7 @@ namespace IndexSuggestionsPOC
 {
     class LogParsingContext
     {
+        public WorkloadDefinition Workload { get; set; }
         public string[] InputColumns { get; set; }
         public LoggedEntryInfo LogEntry { get; private set; }
         public List<LoggedEntryInfo> LogEntries { get; set; }

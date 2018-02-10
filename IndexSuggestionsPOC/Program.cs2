@@ -14,8 +14,19 @@ namespace IndexSuggestionsPOC
     {
         static void Main(string[] args)
         {
-            byte[] dd = new byte[] { 36,/* 0, 0, 0,*/ 116, 101, 115, 116 };
-            var text = Encoding.GetEncoding("windows-1250").GetString(dd);
+            WorkloadDefinition workload = new WorkloadDefinition();
+            workload.DatabaseName = "test";
+            workload.Applications = new WorkloadPropertyValuesDefinition<string>() { RestrictionType = WorkloadPropertyRestrictionType.Disallowed };
+            workload.Applications.Values.Add("test");
+            workload.DateTimeSlots = new WorkloadPropertyValuesDefinition<WorkloadDateTimeSlot>() { RestrictionType = WorkloadPropertyRestrictionType.Disallowed };
+            workload.DateTimeSlots.Values.Add(new WorkloadDateTimeSlot() { DayOfWeek = DayOfWeek.Saturday, StartTime = TimeSpan.FromHours(0), EndTime = new TimeSpan(0, 23, 59, 59, 999) });
+            workload.QueryThresholds = new WorkloadQueryThresholds();
+            workload.QueryThresholds.MinDuration = TimeSpan.FromSeconds(5);
+            workload.Tables = new WorkloadPropertyValuesDefinition<string>() { RestrictionType = WorkloadPropertyRestrictionType.Disallowed };
+            workload.Tables.Values.Add("this_table_is_not_in_workload");
+            workload.Users = new WorkloadPropertyValuesDefinition<string>() { RestrictionType = WorkloadPropertyRestrictionType.Disallowed };
+            workload.Users.Values.Add("this_user_is_not_in_workload");
+
             LogParsingChainFactory chainFactory = new LogParsingChainFactory();
             List<LoggedEntryInfo> logEntries = new List<LoggedEntryInfo>();
             var files = new List<string>(Directory.GetFiles(@"C:\Program Files\PostgreSQL\10\data\log\", "*.log"));
@@ -33,6 +44,7 @@ namespace IndexSuggestionsPOC
                     LogParsingContext context = new LogParsingContext();
                     context.InputColumns = columns;
                     context.LogEntries = logEntries;
+                    context.Workload = workload;
                     chainFactory.ProcessLine(context).Execute();
                     // vieme namapovat statement na query podla sessionid a virtual transaction ID
                     // duration nevyplna virtual transaction ID spravne, takze ho musime mapovat podla statementu
@@ -345,6 +357,7 @@ order by
             }
             // OTAZKA: ako zistit oid databazy podla oid tabulky?
             // ak nie je uvedena foreign table, tak je to aktualna db (uvedena v logu)
+            Console.ReadLine();
         }
         public class PermuteUtils
         {
