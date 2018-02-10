@@ -1,0 +1,441 @@
+﻿using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace IndexSuggestionsPOC
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            byte[] dd = new byte[] { 36,/* 0, 0, 0,*/ 116, 101, 115, 116 };
+            var text = Encoding.GetEncoding("windows-1250").GetString(dd);
+            LogParsingChainFactory chainFactory = new LogParsingChainFactory();
+            List<LoggedEntryInfo> logEntries = new List<LoggedEntryInfo>();
+            var files = new List<string>(Directory.GetFiles(@"C:\Program Files\PostgreSQL\10\data\log\", "*.log"));
+            var filesInfo = new List<FileInfo>();
+            files.ForEach(x => filesInfo.Add(new FileInfo(x)));
+            var latestFile = filesInfo.OrderByDescending(x => x.LastWriteTime).FirstOrDefault();
+            latestFile = new FileInfo(@"C:\Program Files\PostgreSQL\10\data\log\promo.log");
+            var file = File.Open(latestFile.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using (var reader = new StreamReader(file, Encoding.GetEncoding("windows-1250")))
+            {
+                var records = reader.ReadToEnd().Split(new string[] { "^]" }, StringSplitOptions.None);
+                foreach (var record in records)
+                {
+                    var columns = record.Split(new string[] { "¤" }, StringSplitOptions.None);
+                    LogParsingContext context = new LogParsingContext();
+                    context.InputColumns = columns;
+                    context.LogEntries = logEntries;
+                    chainFactory.ProcessLine(context).Execute();
+                    // vieme namapovat statement na query podla sessionid a virtual transaction ID
+                    // duration nevyplna virtual transaction ID spravne, takze ho musime mapovat podla statementu
+
+                    // prvy command bude spracovanie beznych hodnot
+                    // filtrovanie
+                    // factory, ktora doda spravny command na parsovanie - query | statement and duration
+                    // treti command bude vlozenie do kolekcie zaznamov
+
+                    // potom sa to cele zgrupuje statement + duration + query
+                    // pre kazdy statement si ziskame relacie
+                    // potom sa to cele zgrupuje podla relacii
+                }
+            }
+            //
+            var groupsBySessionExecs = logEntries.GroupBy(x => new { x.SessionID, x.VirtualTransactionIdentifier.BackendID, x.VirtualTransactionIdentifier.LocalXID });
+            List<LoggedEntryInfo> filledEntries = new List<LoggedEntryInfo>();
+            LoggedEntryInfo entry = null;
+            // merging of Query, Statement, Plan, Statement log entries into one
+            foreach (var g in groupsBySessionExecs)
+            {
+                foreach (var item in g.OrderBy(x => x.SessionLineNumber))
+                {
+                    if (item.QueryTree != null)
+                    {
+                        if (entry != null && entry.Statement != null && entry.QueryTree != null && entry.PlanTree != null)
+                        {
+                            filledEntries.Add(entry);
+                        }
+                        entry = item;
+                    }
+                    else if (item.Statement != null)
+                    {
+                        entry.Statement = item.Statement;
+                    }
+                    else if (item.PlanTree != null)
+                    {
+                        entry.PlanTree = item.PlanTree;
+                    }
+                }
+            }
+            if (entry != null && entry.Statement != null && entry.QueryTree != null && entry.PlanTree != null)
+            {
+                filledEntries.Add(entry);
+            }
+            // we must correct statements because statements are logged as a whole but query/plan individually
+            // thank you for complication, really
+            foreach (var g in filledEntries.GroupBy(x => new { x.SessionID, x.VirtualTransactionIdentifier.BackendID, x.VirtualTransactionIdentifier.LocalXID, x.Statement }))
+            {
+                if (g.Count() > 1)
+                {
+                    var statements = new Queue<string>(g.Key.Statement.Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries));
+                    foreach (var item in g.OrderBy(x => x.SessionLineNumber))
+                    {
+                        item.Statement = statements.Dequeue().Trim();
+                    }
+                }
+            }
+            QueryPostgresContext postgresContext = new QueryPostgresContext();
+            postgresContext.Query = "SELECT oid, relname, relnamespace, reltype, relfilenode, relkind FROM pg_catalog.pg_class";
+            new QueryPostgresCommand(postgresContext).Execute();
+            PostgresData.Instance.PgClasses = postgresContext.Records;
+
+            var postgresContext2 = new QueryPostgresContext();
+            postgresContext2.Query = "SELECT oid, nspname FROM pg_catalog.pg_namespace";
+            new QueryPostgresCommand(postgresContext2).Execute();
+            PostgresData.Instance.PgNamespaces = postgresContext2.Records;
+
+            var postgresContext3 = new QueryPostgresContext();
+            postgresContext3.Query = "SELECT oid, oprname FROM pg_catalog.pg_operator";
+            new QueryPostgresCommand(postgresContext3).Execute();
+            PostgresData.Instance.PgOperators = postgresContext3.Records;
+
+            var postgresContext4 = new QueryPostgresContext();
+            postgresContext4.Query = "SELECT oid, typname FROM pg_catalog.pg_type";
+            new QueryPostgresCommand(postgresContext4).Execute();
+            PostgresData.Instance.PgTypes = postgresContext4.Records;
+
+            var postgresContext5 = new QueryPostgresContext();
+            postgresContext5.Query = "SELECT attrelid, attname, atttypid, attnum FROM pg_catalog.pg_attribute";
+            new QueryPostgresCommand(postgresContext5).Execute();
+            PostgresData.Instance.PgAttributes = postgresContext5.Records;
+
+            var postgresContext6 = new QueryPostgresContext();
+            postgresContext6.Query = @"
+                select
+    t.oid as table_id,
+    i.oid as index_id,
+    t.relname as table_name,
+    i.relname as index_name,
+    array_to_string(array_agg(a.attname), ',') as column_names
+from
+    pg_class t,
+    pg_class i,
+    pg_index ix,
+    pg_attribute a
+where
+    t.oid = ix.indrelid
+    and i.oid = ix.indexrelid
+    and a.attrelid = t.oid
+    and a.attnum = ANY(ix.indkey)
+group by
+    t.oid,
+    i.oid,
+    t.relname,
+    i.relname
+order by
+    t.relname,
+    i.relname;";
+            new QueryPostgresCommand(postgresContext6).Execute();
+            PostgresData.Instance.Indices = postgresContext6.Records;
+
+            // filter by query type, only selects
+            filledEntries.RemoveAll(x => x.QueryTreeDataProvider.CommandType != CmdType.Select);
+
+            // debug:
+            var mine = filledEntries.Where(x => x.QueryTreeDataProvider.FromTables.Find(y => y.Name == "Customer" || y.Name == "User") != null).ToList();
+            var mineFirst = mine.First();
+            var fromTables = mineFirst.QueryTreeDataProvider.FromTables;
+            var joins = mineFirst.QueryTreeDataProvider.Joins;
+            var wherePredicates = mineFirst.QueryTreeDataProvider.WherePredicates;
+            var havingPredicates = mineFirst.QueryTreeDataProvider.HavingPredicates;
+            var plan = mineFirst.PlanTreeDataProvider.RootPlan;
+
+            /*
+            var mineSecond = mine.Skip(1).First();
+            var fromTables2 = mineSecond.QueryTreeDataProvider.FromTables;
+            var joins2 = mineSecond.QueryTreeDataProvider.Joins;
+            var wherePredicates2 = mineSecond.QueryTreeDataProvider.WherePredicates;
+            var havingPredicates2 = mineSecond.QueryTreeDataProvider.HavingPredicates;
+            var plan2 = mineSecond.PlanTreeDataProvider.RootPlan;
+            */
+            // group by from tables (from + join tables)
+            var groupsByFromTables = mine.GroupBy(x => x.QueryTreeDataProvider.FromTablesHash);
+            // nagenerujeme mozne indexy per grupa
+            foreach (var g in groupsByFromTables)
+            {
+                List<IndexDefinition> possibleIndices = new List<IndexDefinition>();
+                List<IndexDefinition> existingIndices = new List<IndexDefinition>();
+                // unikatne atributy
+                HashSet<AttributeOperand> attributes = new HashSet<AttributeOperand>(new AttributeOperandComparer());
+                foreach (var loggedEntry in g)
+                {
+                    // ziskame si vsetky predikaty z where, join a having
+                    List<PredicateInfo> allPredicates = new List<PredicateInfo>(loggedEntry.QueryTreeDataProvider.WherePredicates);
+                    allPredicates.AddRange(loggedEntry.QueryTreeDataProvider.HavingPredicates);
+                    loggedEntry.QueryTreeDataProvider.Joins.ForEach(x => allPredicates.AddRange(x.Predicates));
+                    foreach (var predicate in allPredicates)
+                    {
+                        foreach (var operand in predicate.Operands)
+                        {
+                            if (operand is AttributeOperand)
+                            {
+                                attributes.Add((AttributeOperand)operand);
+                            }
+                        }
+                    }
+                }
+                // singlecolumn indexy
+                foreach (var a in attributes)
+                {
+                    IndexDefinition index = new IndexDefinition();
+                    index.SchemaName = a.Table.SchemaName;
+                    index.TableName = a.Table.Name;
+                    index.Attributes.Add(a);
+                    possibleIndices.Add(index);
+                }
+                // vygenerujeme 2prvkove permutacie - 2column indexy
+                foreach (var attributesByTable in attributes.GroupBy(x =>x.Table.ID))
+                {
+                    var permutations2n = PermuteUtils.Permute<AttributeOperand>(attributesByTable, 2);
+                    foreach (var p in permutations2n)
+                    {
+                        IndexDefinition index = new IndexDefinition();
+                        index.SchemaName = p.First().Table.SchemaName;
+                        index.TableName = p.First().Table.Name;
+                        index.Attributes.AddRange(p);
+                        possibleIndices.Add(index);
+                    }
+                }
+                // ziskanie existujucich indexov
+                Console.WriteLine("-------------------------------");
+                HashSet<long> tables = new HashSet<long>();
+                foreach (var i in possibleIndices)
+                {
+                    foreach (var a in i.Attributes)
+                    {
+                        tables.Add(a.Table.ID);
+                    }
+                }
+                foreach (var tId in tables)
+                {
+                    var table = PostgresData.Instance.PgClasses.Single(x => x.oid == tId);
+                    var schema = PostgresData.Instance.PgNamespaces.Where(x => x.oid == table.relnamespace).First();
+                    Console.WriteLine("Existing indices for " + schema.nspname + "." + table.relname + ":");
+                    foreach (var existingIndex in PostgresData.Instance.Indices.Where(x => x.table_id == tId))
+                    {
+                        var toAdd = new IndexDefinition();
+                        foreach (var attrName in existingIndex.column_names.Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            toAdd.Attributes.Add(new AttributeOperand() { AttributeName = attrName, Table = new TableInfo() { ID = tId } });
+                        }
+                        toAdd.SchemaName = schema.nspname;
+                        toAdd.TableName = table.relname;
+                        existingIndices.Add(toAdd);
+                        Console.WriteLine(String.Join(",", toAdd.Attributes.Select(x => x.AttributeName)));
+                    }
+                    // temporary fix - Customer.ID index is not returned - but same query in pgadmin is working! strange!!!
+                    if (tId == 16439 && existingIndices.Find(x => x.Attributes.Count == 1 && x.Attributes.First().AttributeName == "ID" && x.Attributes.First().Table.ID == tId) == null)
+                    {
+                        var toAdd = new IndexDefinition();
+                        toAdd.SchemaName = "test";
+                        toAdd.TableName = "Customer";
+                        toAdd.Attributes.Add(new AttributeOperand() { AttributeName = "ID", Table = new TableInfo() { ID = tId } });
+                        existingIndices.Add(toAdd);
+                        Console.WriteLine(String.Join(",", toAdd.Attributes.Select(x => x.AttributeName)));
+                    }
+                }
+                Console.WriteLine("-------------------------------");
+                // remove existing indices from possible
+                var comparer = new AttributeOperandComparer();
+                possibleIndices.RemoveAll(x =>
+                {
+                    return existingIndices.Find(y =>
+                    {
+                        bool cmp = x.Attributes.Count == y.Attributes.Count;
+                        if (cmp)
+                        {
+                            var xAttributes = x.Attributes.OrderBy(z => z.Table.ID).ThenBy(z => z.AttributeName).ToList();
+                            var yAttributes = y.Attributes.OrderBy(z => z.Table.ID).ThenBy(z => z.AttributeName).ToList();
+                            for (int i = 0; i < x.Attributes.Count; i++)
+                            {
+                                if (!comparer.Equals(xAttributes[i], yAttributes[i]))
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                        return cmp;
+                    }) != null;
+                });
+                foreach (var indicesGroupedByTable in possibleIndices.GroupBy(x => x.Attributes.First().Table.ID))
+                {
+                    Console.WriteLine("Possible indices for " + indicesGroupedByTable.First().Attributes.First().Table.SchemaName + "." + indicesGroupedByTable.First().Attributes.First().Table.Name + ":");
+                    foreach (var possibleIndex in indicesGroupedByTable)
+                    {
+                        Console.WriteLine(String.Join(",", possibleIndex.Attributes.Select(x => x.AttributeName)));
+                    }
+                }
+                Console.WriteLine("-------------------------------");
+                List<String> cleaningSqls = new List<string>();
+                try
+                {
+                    List<IndexDefinition> betterIndices = new List<IndexDefinition>();
+                    // create hypo indices
+                    foreach (var i in possibleIndices)
+                    {
+                        i.Name = "hypo_index_" + i.SchemaName + "_" + i.TableName + "_" + String.Join("_", i.Attributes.Select(x => x.AttributeName));
+                        var sql = String.Format("CREATE INDEX \"{0}\" ON \"{1}\".\"{2}\" USING btree ({3})", i.Name, i.SchemaName, i.TableName, String.Join(",", i.Attributes.Select(x => "\"" + x.AttributeName + "\"")));
+                        var postgresContextIndex = new QueryPostgresContext();
+                        postgresContextIndex.Query = sql;
+                        new NonQueryPostgresCommand(postgresContextIndex).Execute();
+                        cleaningSqls.Add(String.Format("DROP INDEX \"{0}\".\"{1}\"", i.SchemaName, i.Name));
+                    }
+                    // get new plans
+                    foreach (var statementGroups in g.GroupBy(x => x.Statement))
+                    {
+                        var postgresContextExplain = new QueryPostgresContext();
+                        postgresContextExplain.Query = String.Format("EXPLAIN (FORMAT JSON) {0}", statementGroups.Key);
+                        new NonQueryPostgresCommand(postgresContextExplain).Execute();
+                        string planJson = postgresContextExplain.Records[0].ToString();
+                        var newPlan = new JsonPlanDataProvider(JArray.Parse(planJson).First);
+                        var newPlanRoot = newPlan.RootPlan;
+                        var oldPlanRoot = statementGroups.First().PlanTreeDataProvider.RootPlan;
+                        if (newPlanRoot.TotalCost < oldPlanRoot.TotalCost)
+                        {
+                            var idxNames = newPlanRoot.Plans.Where(x => x.IndexName != null).Select(x => x.IndexName).ToList();
+                            if (newPlanRoot.IndexName != null)
+                            {
+                                idxNames.Add(newPlanRoot.IndexName); 
+                            }
+                            foreach (var idxName in idxNames)
+                            {
+                                if (betterIndices.Find(x => x.Name == idxName) == null && possibleIndices.Find(x => x.Name == idxName) != null)
+                                {
+                                    betterIndices.Add(possibleIndices.Find(x => x.Name == idxName));
+                                    Console.WriteLine(String.Format("SUGGESTED INDEX: {0}, OldTotalCost: {1}, NewTotalCost: {2}", idxName, oldPlanRoot.TotalCost, newPlanRoot.TotalCost));
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    // drop hypo indices
+                    foreach (var sql in cleaningSqls)
+                    {
+                        var postgresContextIndex = new QueryPostgresContext();
+                        postgresContextIndex.Query = sql;
+                        try
+                        {
+                            new NonQueryPostgresCommand(postgresContextIndex).Execute();
+                        }
+                        catch (Exception)
+                        {
+                            // todo
+                        }
+                    }
+                }
+            }
+            // OTAZKA: ako zistit oid databazy podla oid tabulky?
+            // ak nie je uvedena foreign table, tak je to aktualna db (uvedena v logu)
+        }
+        public class PermuteUtils
+        {
+            // Returns an enumeration of enumerators, one for each permutation
+            // of the input.
+            public static IEnumerable<IEnumerable<T>> Permute<T>(IEnumerable<T> list, int count)
+            {
+                if (count == 0)
+                {
+                    yield return new T[0];
+                }
+                else
+                {
+                    int startingElementIndex = 0;
+                    foreach (T startingElement in list)
+                    {
+                        IEnumerable<T> remainingItems = AllExcept(list, startingElementIndex);
+
+                        foreach (IEnumerable<T> permutationOfRemainder in Permute(remainingItems, count - 1))
+                        {
+                            yield return Concat<T>(
+                                new T[] { startingElement },
+                                permutationOfRemainder);
+                        }
+                        startingElementIndex += 1;
+                    }
+                }
+            }
+
+            // Enumerates over contents of both lists.
+            private static IEnumerable<T> Concat<T>(IEnumerable<T> a, IEnumerable<T> b)
+            {
+                foreach (T item in a) { yield return item; }
+                foreach (T item in b) { yield return item; }
+            }
+
+            // Enumerates over all items in the input, skipping over the item
+            // with the specified offset.
+            private static IEnumerable<T> AllExcept<T>(IEnumerable<T> input, int indexToSkip)
+            {
+                int index = 0;
+                foreach (T item in input)
+                {
+                    if (index != indexToSkip) yield return item;
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    [DebuggerDisplay("{AttributesForDebugger}")]
+    class IndexDefinition
+    {
+        private readonly List<AttributeOperand> attributes = new List<AttributeOperand>();
+
+        public List<AttributeOperand> Attributes
+        {
+            get { return attributes; }
+        }
+        public String Name { get; set; }
+
+        public string SchemaName { get; set; }
+        public string TableName { get; set; }
+
+        private String AttributesForDebugger
+        {
+            get { return String.Join(",", Attributes.Select(x => x.AttributeName)); }
+        }
+    }
+    class AttributeOperandComparer : IEqualityComparer<AttributeOperand>
+    {
+        public bool Equals(AttributeOperand x, AttributeOperand y)
+        {
+            if (x == null)
+            {
+                return y == null;
+            }
+            if (y == null)
+            {
+                return x == null;
+            }
+            return x.AttributeName == y.AttributeName && x.Table.ID == y.Table.ID;
+        }
+
+        public int GetHashCode(AttributeOperand obj)
+        {
+            if (obj == null)
+            {
+                return -1;
+            }
+            return obj.AttributeName.GetHashCode() ^ obj.Table.ID.GetHashCode();
+        }
+    }
+}
